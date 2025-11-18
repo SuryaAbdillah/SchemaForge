@@ -7,6 +7,7 @@ and generate human-readable schema reports.
 
 import json
 import os
+import ast
 import logging
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union, Set
@@ -20,13 +21,22 @@ class SchemaField:
     """Represents a single field in a schema with its properties."""
     
     def __init__(self, name: str, field_type: Union[str, Set[str]], nullable: bool = False,
-                 example_value: Any = None, is_nested: bool = False, nested_fields: Optional[Dict] = None):
+                 example_value: Any = None, is_nested: bool = False, nested_fields: Optional[Dict] = None,
+                 distinct_values: Optional[Set[Any]] = None, min_value: Optional[Any] = None,
+                 max_value: Optional[Any] = None, min_length: Optional[int] = None,
+                 max_length: Optional[int] = None, avg_length: Optional[float] = None):
         self.name = name
         self.field_type = field_type
         self.nullable = nullable
         self.example_value = example_value
         self.is_nested = is_nested
         self.nested_fields = nested_fields or {}
+        self.distinct_values = distinct_values or set()
+        self.min_value = min_value
+        self.max_value = max_value
+        self.min_length = min_length
+        self.max_length = max_length
+        self.avg_length = avg_length
     
     def __repr__(self):
         type_str = self.field_type if isinstance(self.field_type, str) else f"mixed({', '.join(sorted(self.field_type))})"
@@ -74,9 +84,23 @@ class SchemaReader:
         elif isinstance(value, float):
             return "float"
         elif isinstance(value, str):
-            # Try to detect timestamp-like strings
+            # Try to detect special string types
             if self._looks_like_timestamp(value):
                 return "timestamp"
+            elif self._looks_like_url(value):
+                return "url"
+            elif self._looks_like_email(value):
+                return "email"
+            elif self._looks_like_uuid(value):
+                return "uuid"
+            elif self._looks_like_ip_address(value):
+                return "ip_address"
+            elif self._looks_like_numeric_string(value):
+                # Could be a numeric string that should be parsed
+                return "numeric_string"
+            elif self._looks_like_json_string(value):
+                # Embedded JSON string
+                return "json_string"
             return "string"
         elif isinstance(value, list):
             return "array"
@@ -90,18 +114,102 @@ class SchemaReader:
         if not isinstance(value, str) or len(value) < 10:
             return False
         
+        import re
         # Common timestamp patterns
         patterns = [
-            r'^\d{4}-\d{2}-\d{2}',  # ISO date
-            r'^\d{4}-\d{2}-\d{2}T',  # ISO datetime
+            r'^\d{4}-\d{2}-\d{2}',  # ISO date (YYYY-MM-DD)
+            r'^\d{4}-\d{2}-\d{2}T',  # ISO datetime (YYYY-MM-DDTHH:MM:SS)
+            r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}',  # Date time with space
+            r'^\d{4}/\d{2}/\d{2}',  # Date with slashes
+            r'^\d{2}/\d{2}/\d{4}',  # US date format
             r'^\d{10}$',  # Unix timestamp (seconds)
             r'^\d{13}$',  # Unix timestamp (milliseconds)
+            r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}',  # ISO with timezone
+            r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z',  # ISO with Z
         ]
         
-        import re
         for pattern in patterns:
             if re.match(pattern, value):
                 return True
+        return False
+    
+    def _looks_like_url(self, value: str) -> bool:
+        """Check if a string looks like a URL."""
+        if not isinstance(value, str):
+            return False
+        
+        import re
+        # Basic URL pattern
+        url_pattern = r'^https?://[^\s/$.?#].[^\s]*$'
+        return bool(re.match(url_pattern, value, re.IGNORECASE))
+    
+    def _looks_like_email(self, value: str) -> bool:
+        """Check if a string looks like an email address."""
+        if not isinstance(value, str):
+            return False
+        
+        import re
+        # Basic email pattern
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return bool(re.match(email_pattern, value))
+    
+    def _looks_like_uuid(self, value: str) -> bool:
+        """Check if a string looks like a UUID."""
+        if not isinstance(value, str):
+            return False
+        
+        import re
+        # UUID pattern (with or without hyphens)
+        uuid_pattern = r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$'
+        return bool(re.match(uuid_pattern, value, re.IGNORECASE))
+    
+    def _looks_like_ip_address(self, value: str) -> bool:
+        """Check if a string looks like an IP address."""
+        if not isinstance(value, str):
+            return False
+        
+        import re
+        # IPv4 pattern
+        ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+        if re.match(ipv4_pattern, value):
+            # Validate each octet is 0-255
+            try:
+                parts = value.split('.')
+                if all(0 <= int(part) <= 255 for part in parts):
+                    return True
+            except ValueError:
+                pass
+        
+        # IPv6 pattern (simplified)
+        ipv6_pattern = r'^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::1$|^::$'
+        return bool(re.match(ipv6_pattern, value))
+    
+    def _looks_like_numeric_string(self, value: str) -> bool:
+        """Check if a string contains only numeric characters (could be parsed as number)."""
+        if not isinstance(value, str) or not value.strip():
+            return False
+        
+        import re
+        # Matches integers, floats, scientific notation, with optional leading/trailing whitespace
+        numeric_pattern = r'^\s*[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?\s*$'
+        return bool(re.match(numeric_pattern, value))
+    
+    def _looks_like_json_string(self, value: str) -> bool:
+        """Check if a string looks like embedded JSON."""
+        if not isinstance(value, str) or len(value) < 2:
+            return False
+        
+        value = value.strip()
+        # Check if it starts and ends with JSON-like delimiters
+        if (value.startswith('{') and value.endswith('}')) or \
+           (value.startswith('[') and value.endswith(']')):
+            # Try to parse it
+            try:
+                json.loads(value)
+                return True
+            except (json.JSONDecodeError, ValueError):
+                pass
+        
         return False
     
     def _flatten_dict(self, d: Dict, parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
@@ -134,12 +242,55 @@ class SchemaReader:
         types = set()
         example_value = None
         
+        # Statistics collection
+        numeric_values = []
+        string_lengths = []
+        distinct_values_set = set()
+        min_val = None
+        max_val = None
+        
         for value in non_null_values:
             inferred_type = self._infer_type(value)
             types.add(inferred_type)
             
             if example_value is None:
                 example_value = value
+            
+            # Collect distinct values for enum detection
+            try:
+                # Use hashable representation for distinct values
+                if isinstance(value, (str, int, float, bool)):
+                    distinct_values_set.add(value)
+                elif isinstance(value, list):
+                    distinct_values_set.add(tuple(value) if len(value) <= 10 else str(value))
+                elif isinstance(value, dict):
+                    distinct_values_set.add(str(sorted(value.items())) if len(value) <= 10 else str(value))
+                else:
+                    distinct_values_set.add(str(value))
+            except (TypeError, ValueError):
+                pass
+            
+            # Collect numeric statistics
+            if isinstance(value, (int, float)):
+                numeric_values.append(value)
+                if min_val is None or value < min_val:
+                    min_val = value
+                if max_val is None or value > max_val:
+                    max_val = value
+            elif isinstance(value, str) and self._looks_like_numeric_string(value):
+                try:
+                    num_val = float(value)
+                    numeric_values.append(num_val)
+                    if min_val is None or num_val < min_val:
+                        min_val = num_val
+                    if max_val is None or num_val > max_val:
+                        max_val = num_val
+                except (ValueError, TypeError):
+                    pass
+            
+            # Collect string length statistics
+            if isinstance(value, str):
+                string_lengths.append(len(value))
             
             # Handle nested objects
             if isinstance(value, dict):
@@ -184,7 +335,31 @@ class SchemaReader:
         else:
             final_type = types  # Mixed types
         
-        return SchemaField(field_name, final_type, nullable=nullable, example_value=example_value)
+        # Calculate statistics
+        min_value = min_val if numeric_values else None
+        max_value = max_val if numeric_values else None
+        min_length = min(string_lengths) if string_lengths else None
+        max_length = max(string_lengths) if string_lengths else None
+        avg_length = sum(string_lengths) / len(string_lengths) if string_lengths else None
+        
+        # Detect enum (if distinct values are limited and represent a small percentage)
+        # Consider it an enum if there are <= 20 distinct values and they represent > 50% of non-null values
+        distinct_count = len(distinct_values_set)
+        enum_threshold = min(20, len(non_null_values) // 2)
+        distinct_values = distinct_values_set if distinct_count <= enum_threshold else set()
+        
+        return SchemaField(
+            field_name,
+            final_type,
+            nullable=nullable,
+            example_value=example_value,
+            distinct_values=distinct_values,
+            min_value=min_value,
+            max_value=max_value,
+            min_length=min_length,
+            max_length=max_length,
+            avg_length=avg_length
+        )
     
     def _extract_columns_from_metadata(self, metadata: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         """Extract column definitions from metadata (e.g., Socrata/OpenData format)."""
@@ -272,6 +447,7 @@ class SchemaReader:
         - Array-based tabular data (arrays of arrays) with column metadata
         - GeoJSON format
         - Single JSON object (treated as single record)
+        - Python literal format (dict/list literals with single quotes)
         """
         records = []
         
@@ -358,35 +534,75 @@ class SchemaReader:
                         return records
                 
                 except json.JSONDecodeError:
-                    # Try NDJSON format (one JSON object per line)
-                    logger.info(f"Trying NDJSON format for {filepath.name}")
-                    f.seek(0)
-                    for line_num, line in enumerate(f, 1):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                            if isinstance(record, dict):
-                                # Check if this line is a wrapper with data array
-                                data_fields = ['data', 'results', 'items', 'records', 'rows', 'entries']
-                                extracted_records = None
-                                
-                                for field_name in data_fields:
-                                    if field_name in record and isinstance(record[field_name], list):
-                                        extracted_records = record[field_name]
-                                        break
-                                
-                                if extracted_records is not None:
-                                    records.extend(extracted_records)
-                                else:
-                                    records.append(record)
-                            elif isinstance(record, list):
-                                # Array in NDJSON line
-                                records.extend(record)
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"Failed to parse line {line_num} in {filepath.name}: {e}")
-                            continue
+                    # Try Python literal format for entire file
+                    try:
+                        logger.info(f"Trying Python literal format for {filepath.name}")
+                        data = ast.literal_eval(content)
+                        
+                        if isinstance(data, list):
+                            # List of records
+                            if len(data) > 0 and isinstance(data[0], dict):
+                                records = data
+                            elif len(data) > 0 and isinstance(data[0], list):
+                                # Array of arrays
+                                max_cols = max(len(row) for row in data if isinstance(row, list))
+                                columns = [{'name': f'column_{i}', 'position': i} for i in range(max_cols)]
+                                records = [self._convert_array_row_to_object(row, columns) for row in data]
+                        elif isinstance(data, dict):
+                            # Single dict or wrapper
+                            data_fields = ['data', 'results', 'items', 'records', 'rows', 'entries']
+                            extracted_data = None
+                            
+                            for field_name in data_fields:
+                                if field_name in data and isinstance(data[field_name], list):
+                                    extracted_data = data[field_name]
+                                    break
+                            
+                            if extracted_data is not None:
+                                records = extracted_data
+                            else:
+                                records = [data]
+                        else:
+                            logger.warning(f"Unexpected Python literal structure in {filepath.name}: {type(data)}")
+                            return records
+                    except (ValueError, SyntaxError):
+                        # Try NDJSON format (one JSON object per line)
+                        logger.info(f"Trying NDJSON format for {filepath.name}")
+                        f.seek(0)
+                        for line_num, line in enumerate(f, 1):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                record = json.loads(line)
+                                if isinstance(record, dict):
+                                    # Check if this line is a wrapper with data array
+                                    data_fields = ['data', 'results', 'items', 'records', 'rows', 'entries']
+                                    extracted_records = None
+                                    
+                                    for field_name in data_fields:
+                                        if field_name in record and isinstance(record[field_name], list):
+                                            extracted_records = record[field_name]
+                                            break
+                                    
+                                    if extracted_records is not None:
+                                        records.extend(extracted_records)
+                                    else:
+                                        records.append(record)
+                                elif isinstance(record, list):
+                                    # Array in NDJSON line
+                                    records.extend(record)
+                            except json.JSONDecodeError:
+                                # Try Python literal format (e.g., {'key': 'value'})
+                                try:
+                                    record = ast.literal_eval(line)
+                                    if isinstance(record, dict):
+                                        records.append(record)
+                                    elif isinstance(record, list):
+                                        records.extend(record)
+                                except (ValueError, SyntaxError) as e:
+                                    logger.warning(f"Failed to parse line {line_num} in {filepath.name}: {e}")
+                                    continue
         
         except Exception as e:
             logger.error(f"Error reading file {filepath.name}: {e}")
@@ -439,7 +655,21 @@ class SchemaReader:
             for record in sampled_records:
                 flattened = self._flatten_dict(record)
                 for key, value in flattened.items():
-                    field_values[key].append(value)
+                    # Try to parse embedded JSON strings
+                    if isinstance(value, str) and self._looks_like_json_string(value):
+                        try:
+                            parsed = json.loads(value)
+                            # If it's a dict or list, we might want to flatten it further
+                            # For now, keep both the string and parsed version for analysis
+                            field_values[key].append(value)  # Keep original
+                            # Also add parsed version with a suffix
+                            if isinstance(parsed, dict):
+                                for nested_key, nested_val in parsed.items():
+                                    field_values[f"{key}.parsed.{nested_key}"].append(nested_val)
+                        except (json.JSONDecodeError, ValueError):
+                            field_values[key].append(value)
+                    else:
+                        field_values[key].append(value)
             
             # Analyze each field
             fields = {}
@@ -501,8 +731,8 @@ class SchemaReader:
             lines.append("")
             lines.append("### Field Details")
             lines.append("")
-            lines.append("| Field Name | Type | Nullable | Example Value | Notes |")
-            lines.append("|------------|------|----------|---------------|-------|")
+            lines.append("| Field Name | Type | Nullable | Example Value | Statistics | Notes |")
+            lines.append("|------------|------|----------|---------------|------------|-------|")
             
             for field_name in sorted(schema.fields.keys()):
                 field = schema.fields[field_name]
@@ -519,6 +749,25 @@ class SchemaReader:
                     example_str = example_str[:47] + "..."
                 example_str = example_str.replace("|", "\\|")  # Escape pipe for markdown
                 
+                # Format statistics
+                stats = []
+                if field.min_value is not None and field.max_value is not None:
+                    stats.append(f"min: {field.min_value}, max: {field.max_value}")
+                if field.min_length is not None and field.max_length is not None:
+                    if field.avg_length is not None:
+                        stats.append(f"len: {field.min_length}-{field.max_length} (avg: {field.avg_length:.1f})")
+                    else:
+                        stats.append(f"len: {field.min_length}-{field.max_length}")
+                if field.distinct_values and len(field.distinct_values) <= 10:
+                    # Show enum values if small set
+                    enum_vals = sorted([str(v) for v in list(field.distinct_values)[:10]])
+                    if len(enum_vals) <= 5:
+                        stats.append(f"enum: {', '.join(enum_vals)}")
+                    else:
+                        stats.append(f"enum: {len(field.distinct_values)} values")
+                stats_str = "; ".join(stats) if stats else "-"
+                stats_str = stats_str.replace("|", "\\|")  # Escape pipe for markdown
+                
                 # Notes
                 notes = []
                 if field.nullable:
@@ -527,9 +776,11 @@ class SchemaReader:
                     notes.append("nested")
                 if isinstance(field.field_type, set):
                     notes.append("mixed types")
+                if field.distinct_values and len(field.distinct_values) <= 20:
+                    notes.append("enum-like")
                 notes_str = ", ".join(notes) if notes else "-"
                 
-                lines.append(f"| `{field_name}` | {type_str} | {'Yes' if field.nullable else 'No'} | `{example_str}` | {notes_str} |")
+                lines.append(f"| `{field_name}` | {type_str} | {'Yes' if field.nullable else 'No'} | `{example_str}` | {stats_str} | {notes_str} |")
             
             lines.append("")
             lines.append("---")
@@ -572,13 +823,25 @@ class SchemaReader:
                 else:
                     field_type_serialized = field.field_type
                 
+                # Convert distinct_values to serializable format
+                distinct_values_serialized = None
+                if field.distinct_values:
+                    distinct_values_serialized = [str(v) if not isinstance(v, (str, int, float, bool)) else v 
+                                                   for v in list(field.distinct_values)[:100]]  # Limit to 100
+                
                 schema_data["fields"][field_name] = {
                     "name": field.name,
                     "field_type": field_type_serialized,
                     "nullable": field.nullable,
                     "example_value": str(field.example_value) if field.example_value is not None else None,
                     "is_nested": field.is_nested,
-                    "nested_fields": field.nested_fields if field.nested_fields else {}
+                    "nested_fields": field.nested_fields if field.nested_fields else {},
+                    "distinct_values": distinct_values_serialized,
+                    "min_value": field.min_value,
+                    "max_value": field.max_value,
+                    "min_length": field.min_length,
+                    "max_length": field.max_length,
+                    "avg_length": field.avg_length
                 }
             
             schemas_dict[filename] = schema_data
@@ -610,13 +873,24 @@ class SchemaReader:
                 if isinstance(field_type, list):
                     field_type = set(field_type)
                 
+                # Convert distinct_values back from serialized format
+                distinct_values = None
+                if field_data.get("distinct_values"):
+                    distinct_values = set(field_data["distinct_values"])
+                
                 field = SchemaField(
                     name=field_data["name"],
                     field_type=field_type,
                     nullable=field_data["nullable"],
                     example_value=field_data.get("example_value"),
                     is_nested=field_data.get("is_nested", False),
-                    nested_fields=field_data.get("nested_fields", {})
+                    nested_fields=field_data.get("nested_fields", {}),
+                    distinct_values=distinct_values,
+                    min_value=field_data.get("min_value"),
+                    max_value=field_data.get("max_value"),
+                    min_length=field_data.get("min_length"),
+                    max_length=field_data.get("max_length"),
+                    avg_length=field_data.get("avg_length")
                 )
                 fields[field_name] = field
             
