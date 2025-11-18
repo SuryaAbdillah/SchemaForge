@@ -6,6 +6,7 @@ using the schemas inferred by the schema reader.
 """
 
 import json
+import ast
 import logging
 import pandas as pd
 import pyarrow as pa
@@ -80,14 +81,42 @@ class Converter:
         
         try:
             if type_str == "integer":
-                return int(value)
+                if isinstance(value, (int, float)):
+                    return int(value)
+                elif isinstance(value, str):
+                    # Try to parse numeric strings
+                    try:
+                        return int(float(value))  # Use float first to handle "123.0"
+                    except (ValueError, TypeError):
+                        return value
+                return value
             elif type_str == "float":
-                return float(value)
+                if isinstance(value, (int, float)):
+                    return float(value)
+                elif isinstance(value, str):
+                    try:
+                        return float(value)
+                    except (ValueError, TypeError):
+                        return value
+                return value
+            elif type_str == "numeric_string":
+                # Keep as string but ensure it's numeric
+                if isinstance(value, (int, float)):
+                    return str(value)
+                return str(value)
             elif type_str == "boolean":
                 if isinstance(value, bool):
                     return value
-                return str(value).lower() in ('true', '1', 'yes', 'on')
-            elif type_str == "string" or type_str == "timestamp":
+                str_val = str(value).lower().strip()
+                return str_val in ('true', '1', 'yes', 'on', 'y', 't')
+            elif type_str in ("string", "timestamp", "url", "email", "uuid", "ip_address"):
+                return str(value)
+            elif type_str == "json_string":
+                # If it's already a JSON string, keep it; otherwise stringify
+                if isinstance(value, str):
+                    return value
+                elif isinstance(value, (dict, list)):
+                    return json.dumps(value)
                 return str(value)
             else:
                 return value
@@ -179,6 +208,7 @@ class Converter:
         - Array-based tabular data (arrays of arrays) with column metadata
         - GeoJSON format
         - Single JSON object (treated as single record)
+        - Python literal format (dict/list literals with single quotes)
         """
         records = []
         
@@ -265,35 +295,75 @@ class Converter:
                         return records
                 
                 except json.JSONDecodeError:
-                    # Try NDJSON format (one JSON object per line)
-                    logger.info(f"Trying NDJSON format for {filepath.name}")
-                    f.seek(0)
-                    for line_num, line in enumerate(f, 1):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                            if isinstance(record, dict):
-                                # Check if this line is a wrapper with data array
-                                data_fields = ['data', 'results', 'items', 'records', 'rows', 'entries']
-                                extracted_records = None
-                                
-                                for field_name in data_fields:
-                                    if field_name in record and isinstance(record[field_name], list):
-                                        extracted_records = record[field_name]
-                                        break
-                                
-                                if extracted_records is not None:
-                                    records.extend(extracted_records)
-                                else:
-                                    records.append(record)
-                            elif isinstance(record, list):
-                                # Array in NDJSON line
-                                records.extend(record)
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"Failed to parse line {line_num} in {filepath.name}: {e}")
-                            continue
+                    # Try Python literal format for entire file
+                    try:
+                        logger.info(f"Trying Python literal format for {filepath.name}")
+                        data = ast.literal_eval(content)
+                        
+                        if isinstance(data, list):
+                            # List of records
+                            if len(data) > 0 and isinstance(data[0], dict):
+                                records = data
+                            elif len(data) > 0 and isinstance(data[0], list):
+                                # Array of arrays
+                                max_cols = max(len(row) for row in data if isinstance(row, list))
+                                columns = [{'name': f'column_{i}', 'position': i} for i in range(max_cols)]
+                                records = [self._convert_array_row_to_object(row, columns) for row in data]
+                        elif isinstance(data, dict):
+                            # Single dict or wrapper
+                            data_fields = ['data', 'results', 'items', 'records', 'rows', 'entries']
+                            extracted_data = None
+                            
+                            for field_name in data_fields:
+                                if field_name in data and isinstance(data[field_name], list):
+                                    extracted_data = data[field_name]
+                                    break
+                            
+                            if extracted_data is not None:
+                                records = extracted_data
+                            else:
+                                records = [data]
+                        else:
+                            logger.warning(f"Unexpected Python literal structure in {filepath.name}: {type(data)}")
+                            return records
+                    except (ValueError, SyntaxError):
+                        # Try NDJSON format (one JSON object per line)
+                        logger.info(f"Trying NDJSON format for {filepath.name}")
+                        f.seek(0)
+                        for line_num, line in enumerate(f, 1):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                record = json.loads(line)
+                                if isinstance(record, dict):
+                                    # Check if this line is a wrapper with data array
+                                    data_fields = ['data', 'results', 'items', 'records', 'rows', 'entries']
+                                    extracted_records = None
+                                    
+                                    for field_name in data_fields:
+                                        if field_name in record and isinstance(record[field_name], list):
+                                            extracted_records = record[field_name]
+                                            break
+                                    
+                                    if extracted_records is not None:
+                                        records.extend(extracted_records)
+                                    else:
+                                        records.append(record)
+                                elif isinstance(record, list):
+                                    # Array in NDJSON line
+                                    records.extend(record)
+                            except json.JSONDecodeError:
+                                # Try Python literal format (e.g., {'key': 'value'})
+                                try:
+                                    record = ast.literal_eval(line)
+                                    if isinstance(record, dict):
+                                        records.append(record)
+                                    elif isinstance(record, list):
+                                        records.extend(record)
+                                except (ValueError, SyntaxError) as e:
+                                    logger.warning(f"Failed to parse line {line_num} in {filepath.name}: {e}")
+                                    continue
         
         except Exception as e:
             logger.error(f"Error reading file {filepath.name}: {e}")

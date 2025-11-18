@@ -49,19 +49,29 @@ Errors: Many → Zero
 ## ✨ Features
 
 ### 🧠 Intelligent Schema Inference
-- **Automatic Type Detection**: Strings, integers, floats, booleans, timestamps, arrays, objects
+- **Advanced Type Detection**: Strings, integers, floats, booleans, timestamps, URLs, emails, UUIDs, IP addresses, arrays, objects
+- **Smart String Analysis**: Detects URLs, email addresses, UUIDs, IP addresses, and numeric strings
+- **Enhanced Timestamp Detection**: Supports ISO dates, Unix timestamps, and multiple date formats
+- **Enum Detection**: Automatically identifies fields with limited distinct values (enum-like fields)
+- **Statistical Analysis**: Collects min/max values for numbers, length statistics for strings
 - **Nested Structure Handling**: Flattens nested JSON with dot notation (`user.address.city`)
 - **Nullable Field Detection**: Identifies which fields can be null
 - **Mixed Type Recognition**: Detects and reports inconsistent types across records
+- **Embedded JSON Parsing**: Automatically detects and parses JSON strings embedded in fields
 
 ### 📁 Multi-Format JSON Support
-Handles 6+ JSON formats automatically:
+Handles 11+ JSON formats automatically:
 - ✅ **Standard JSON Arrays**: `[{...}, {...}]`
 - ✅ **NDJSON** (Newline-Delimited): One object per line
 - ✅ **Wrapper Objects**: `{data: [...]}`, `{results: [...]}`, etc.
 - ✅ **Array-Based Tabular**: Socrata/OpenData format with metadata
 - ✅ **GeoJSON**: FeatureCollection format
 - ✅ **Single Objects**: Single-record datasets
+- ✅ **Python Literal Format**: `{'key': 'value'}` with single quotes (Python dict/list syntax)
+- ✅ **Embedded JSON Strings**: JSON stored as string values (auto-parsed)
+- ✅ **Numeric Strings**: String values that represent numbers (auto-detected)
+- ✅ **Mixed Format Files**: Handles files with inconsistent structures
+- ✅ **JSON with Comments**: Basic support for comment-like structures
 
 ### 🔄 Schema-First Workflow
 1. **Scan once** → Generate comprehensive schema reports
@@ -328,9 +338,15 @@ SchemaForge detects these types automatically:
 | `integer` | Whole numbers | `42` |
 | `float` | Decimal numbers | `3.14` |
 | `boolean` | True/false | `true` |
-| `timestamp` | Date/time strings | `"2023-01-01T10:00:00Z"` |
+| `timestamp` | Date/time strings | `"2023-01-01T10:00:00Z"`, `"2023/01/01"`, Unix timestamps |
+| `url` | Web URLs | `"https://example.com"` |
+| `email` | Email addresses | `"user@example.com"` |
+| `uuid` | UUID identifiers | `"550e8400-e29b-41d4-a716-446655440000"` |
+| `ip_address` | IP addresses (IPv4/IPv6) | `"192.168.1.1"`, `"2001:db8::1"` |
+| `numeric_string` | String values representing numbers | `"123"`, `"45.67"` |
+| `json_string` | Embedded JSON stored as string | `"{\"key\": \"value\"}"` |
 | `array<T>` | Lists of values | `["a", "b", "c"]` |
-| `object` | Nested structures | `{"key": "value"}` |
+| `object` | Nested structures | `{"key": "value"}` | |
 
 #### Nested Structures
 Nested objects are flattened with dot notation:
@@ -353,6 +369,23 @@ Nested objects are flattened with dot notation:
 
 #### Nullable Fields
 Fields containing `null` values are marked as nullable in the schema.
+
+#### Statistics & Analysis
+SchemaForge automatically collects statistical information for each field:
+
+- **Numeric Statistics**: Min/max values for integer and float fields
+- **String Statistics**: Min/max/average length for string fields
+- **Enum Detection**: Fields with limited distinct values (≤20) are flagged as enum-like
+- **Value Distribution**: Distinct value sets are tracked for enum detection
+
+**Example Report Output:**
+```
+| Field Name | Type | Statistics | Notes |
+|------------|------|------------|-------|
+| `age` | integer | min: 18, max: 65 | nullable |
+| `email` | email | len: 10-50 (avg: 25.3) | nullable |
+| `status` | string | enum: active, inactive, pending | enum-like |
+```
 
 ---
 
