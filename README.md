@@ -629,6 +629,7 @@ We welcome contributions! Here are some ideas:
 - [ ] GUI/Web interface
 - [ ] Docker support
 - [ ] Schema diff tool
+- [ ] Add DuckDB conversion
 
 ### How to Contribute
 1. Fork the repository
