@@ -199,58 +199,81 @@ def sample_records(records: List[Dict[str, Any]], max_sample_size: Optional[int]
     else:  # default to "first"
         return records[:size]
 
+def reservoir_sample(iterator, sample_size: int):
+    """
+    Reservoir sampling algorithm for random sampling from a stream.
+    This allows us to randomly sample without loading all records into memory.
+    """
+    import random
+    reservoir = []
+    count = 0
+    
+    for item in iterator:
+        count += 1
+        if len(reservoir) < sample_size:
+            reservoir.append(item)
+        else:
+            # Randomly replace an element in the reservoir
+            j = random.randint(0, count - 1)
+            if j < sample_size:
+                reservoir[j] = item
+    
+    return reservoir, count
+
 def infer_schema(filepath: Path, max_sample_size: Optional[int] = None, sampling_strategy: str = "first") -> Optional[FileSchema]:
     """Infer schema for a single JSON file."""
     logger.info(f"Processing file: {filepath.name}")
     
+    # Check file size to determine if we should use streaming
+    file_size_mb = filepath.stat().st_size / (1024 * 1024)
+    use_streaming = file_size_mb > 10  # Use streaming for files > 10MB
+    
     # Default to a reasonable sample size if not specified to avoid "stuck" analysis on huge files
-    # 100,000 records is usually plenty for schema inference
     effective_sample_size = max_sample_size
     if effective_sample_size is None:
         effective_sample_size = 10000
         logger.info(f"No max_sample_size set. Defaulting to {effective_sample_size} for performance.")
 
     try:
-        # Use streaming for potentially large files if max_sample_size is set but small
-        # or if we just want to be efficient.
-        # For schema inference, we often need to see many records.
-        # If sampling is 'first', streaming is great.
-        # If sampling is 'random', we need to load more or reservoir sample.
-        
-        stream = sampling_strategy == "first"
+        # Always use streaming for large files or when sampling strategy allows it
+        # For random sampling, we'll use reservoir sampling which doesn't require loading everything
+        stream = use_streaming or sampling_strategy == "first"
         records_iter = load_json_file(filepath, stream=stream)
         
+        actual_record_count = -1  # Unknown initially
+        sampled_records = []
+        
         if stream:
-            # Consume iterator to get list if we need random access later or just to simplify
-            # But if we only need first N, we can slice the iterator
-            if effective_sample_size and sampling_strategy == "first":
+            if sampling_strategy == "first" and effective_sample_size:
+                # For first N records, just take the first N from the stream
                 import itertools
-                records = list(itertools.islice(records_iter, effective_sample_size))
-                # We don't know total count without reading all
-                actual_record_count = -1 # Unknown
+                sampled_records = list(itertools.islice(records_iter, effective_sample_size))
+                actual_record_count = len(sampled_records)  # We only know the sampled count
+                logger.info(f"Streaming first {len(sampled_records)} records from {filepath.name}")
+            elif sampling_strategy == "random" and effective_sample_size:
+                # Use reservoir sampling for random sampling without loading everything
+                sampled_records, actual_record_count = reservoir_sample(records_iter, effective_sample_size)
+                logger.info(f"Reservoir sampled {len(sampled_records)} of {actual_record_count} records from {filepath.name}")
             else:
-                records = list(records_iter)
-                actual_record_count = len(records)
+                # Need all records - still stream but collect them
+                sampled_records = list(records_iter)
+                actual_record_count = len(sampled_records)
         else:
+            # Small file - load into memory
             records = records_iter
             actual_record_count = len(records)
+            
+            # Sample records if needed
+            if sampling_strategy == "random" and effective_sample_size and len(records) > effective_sample_size:
+                sampled_records = sample_records(records, effective_sample_size, sampling_strategy)
+            elif sampling_strategy == "first" and effective_sample_size and len(records) > effective_sample_size:
+                sampled_records = records[:effective_sample_size]
+            else:
+                sampled_records = records
         
-        if not records:
+        if not sampled_records:
             logger.warning(f"No records found in {filepath.name}")
             return None
-        
-        if actual_record_count == -1:
-             # If we streamed a subset, we might not know the total. 
-             # For now, let's just say "at least X" or just use the sample count
-             actual_record_count = len(records)
-
-        # Sample records if needed (if we didn't already limit during load)
-        if sampling_strategy == "random" and effective_sample_size and len(records) > effective_sample_size:
-             sampled_records = sample_records(records, effective_sample_size, sampling_strategy)
-        elif sampling_strategy == "first" and effective_sample_size and len(records) > effective_sample_size:
-             sampled_records = records[:effective_sample_size]
-        else:
-             sampled_records = records
         
         sampled_count = len(sampled_records)
         logger.info(f"Analyzing {sampled_count} of {actual_record_count} records from {filepath.name}")

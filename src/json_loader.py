@@ -24,6 +24,7 @@ def load_json_file(filepath: Path, stream: bool = False) -> Union[List[Dict[str,
         filepath: Path to the JSON file.
         stream: If True, returns a generator for streaming records (useful for large files).
                 Note: Streaming is best effort and may fall back to loading all if structure allows.
+                If False but file is > 50MB, will automatically use streaming.
     
     Returns:
         List of records or a generator yielding records.
@@ -31,6 +32,12 @@ def load_json_file(filepath: Path, stream: bool = False) -> Union[List[Dict[str,
     filepath = Path(filepath)
     if not filepath.exists():
         raise FileNotFoundError(f"File not found: {filepath}")
+
+    # Automatically use streaming for large files (> 50MB) even if stream=False
+    file_size_mb = filepath.stat().st_size / (1024 * 1024)
+    if not stream and file_size_mb > 50:
+        logger.info(f"File {filepath.name} is {file_size_mb:.1f}MB. Using streaming for efficiency.")
+        stream = True
 
     if stream:
         return _load_json_stream(filepath)
@@ -126,7 +133,10 @@ def _load_json_memory(filepath: Path) -> List[Dict[str, Any]]:
     """Load JSON file completely into memory."""
     records = []
     try:
+        # For very large files, prefer streaming even in memory mode
+        # But this function is only called for smaller files now
         with open(filepath, 'r', encoding='utf-8') as f:
+            # Use read() but with a size hint for better memory management
             content = f.read().strip()
             
             if not content:
