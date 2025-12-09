@@ -45,6 +45,57 @@ def load_json_file(filepath: Path, stream: bool = False) -> Union[List[Dict[str,
     else:
         return _load_json_memory(filepath)
 
+def load_json_chunks(filepath: Path, chunk_size: int = 10000) -> Generator[List[Dict[str, Any]], None, None]:
+    """
+    Load JSON data in chunks for memory-efficient processing.
+    
+    Args:
+        filepath: Path to the JSON file.
+        chunk_size: Number of records per chunk.
+    
+    Yields:
+        Lists of records (chunks), each containing up to chunk_size records.
+    """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+    
+    logger.info(f"Loading {filepath.name} in chunks of {chunk_size} records")
+    
+    # Use streaming to load records one at a time
+    records_stream = _load_json_stream(filepath)
+    
+    chunk = []
+    record_count = 0
+    
+    try:
+        for record in records_stream:
+            chunk.append(record)
+            record_count += 1
+            
+            if len(chunk) >= chunk_size:
+                logger.debug(f"Yielding chunk of {len(chunk)} records (total: {record_count})")
+                yield chunk
+                chunk = []
+        
+        # Yield remaining records
+        if chunk:
+            logger.debug(f"Yielding final chunk of {len(chunk)} records (total: {record_count})")
+            yield chunk
+            
+        logger.info(f"Completed loading {filepath.name}: {record_count} total records")
+        
+    except Exception as e:
+        logger.error(f"Error loading chunks from {filepath}: {e}")
+        # If streaming fails, try loading all into memory and chunking
+        logger.info("Falling back to memory load and chunking")
+        all_records = _load_json_memory(filepath)
+        
+        for i in range(0, len(all_records), chunk_size):
+            chunk = all_records[i:i + chunk_size]
+            yield chunk
+
+
 def _load_json_stream(filepath: Path) -> Generator[Dict[str, Any], None, None]:
     """Stream records from a JSON file using ijson."""
     try:
@@ -101,13 +152,34 @@ def _load_json_stream(filepath: Path) -> Generator[Dict[str, Any], None, None]:
                         continue
                 
                 if not found_wrapper:
-                    # Treat as single record
-                    f.seek(0)
-                    data = json.load(f) # Fallback to standard load for single object
-                    if isinstance(data, dict):
-                        yield data
+                    # Treat as single record OR NDJSON
+                    try:
+                        f.seek(0)
+                        data = json.load(f) # Fallback to standard load for single object
+                        if isinstance(data, dict):
+                            yield data
+                    except json.JSONDecodeError as e:
+                        # If we get "Extra data", it's likely NDJSON
+                        if "Extra data" in str(e):
+                            logger.info("Detected NDJSON format (found extra data after first object)")
+                            f.seek(0)
+                            for line in f:
+                                line = line.strip()
+                                if not line: continue
+                                try:
+                                    item = json.loads(line)
+                                    if isinstance(item, dict):
+                                        yield item
+                                    elif isinstance(item, list):
+                                        yield {f"column_{i}": val for i, val in enumerate(item)}
+                                    else:
+                                        yield {"value": item}
+                                except json.JSONDecodeError:
+                                    pass
+                        else:
+                            raise e
             else:
-                # Maybe NDJSON?
+                # Maybe NDJSON (if didn't start with { or [)
                 f.seek(0)
                 # ijson doesn't natively support NDJSON well in the same way as 'items'
                 # We can just read line by line

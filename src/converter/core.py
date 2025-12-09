@@ -61,31 +61,44 @@ class Converter:
     def _prepare_dataframe(self, records: List[Dict[str, Any]], schema: FileSchema):
         return prepare_dataframe(records, schema)
 
-    def convert_to_parquet(self, filepath: Path, schema: Optional[FileSchema] = None) -> bool:
+    def convert_to_parquet(self, filepath: Path, schema: Optional[FileSchema] = None, 
+                          chunk_size: Optional[int] = None) -> bool:
         """Convert a JSON file to Parquet format."""
-        return convert_to_parquet(filepath, self.output_dir, self.schema_reader, schema)
+        return convert_to_parquet(filepath, self.output_dir, self.schema_reader, schema, chunk_size)
     
-    def convert_to_csv(self, filepath: Path, schema: Optional[FileSchema] = None) -> bool:
+    def convert_to_csv(self, filepath: Path, schema: Optional[FileSchema] = None,
+                      chunk_size: Optional[int] = None) -> bool:
         """Convert a JSON file to CSV format."""
-        return convert_to_csv(filepath, self.output_dir, self.schema_reader, schema)
+        return convert_to_csv(filepath, self.output_dir, self.schema_reader, schema, chunk_size)
     
-    def convert_to_avro(self, filepath: Path, schema: Optional[FileSchema] = None) -> bool:
+    def convert_to_avro(self, filepath: Path, schema: Optional[FileSchema] = None,
+                       chunk_size: Optional[int] = None) -> bool:
         """Convert a JSON file to Avro format."""
-        return convert_to_avro(filepath, self.output_dir, self.schema_reader, schema)
+        return convert_to_avro(filepath, self.output_dir, self.schema_reader, schema, chunk_size)
     
-    def convert_to_orc(self, filepath: Path, schema: Optional[FileSchema] = None) -> bool:
+    def convert_to_orc(self, filepath: Path, schema: Optional[FileSchema] = None,
+                      chunk_size: Optional[int] = None) -> bool:
         """Convert a JSON file to ORC format."""
-        return convert_to_orc(filepath, self.output_dir, self.schema_reader, schema)
+        return convert_to_orc(filepath, self.output_dir, self.schema_reader, schema, chunk_size)
     
-    def convert_to_feather(self, filepath: Path, schema: Optional[FileSchema] = None) -> bool:
+    def convert_to_feather(self, filepath: Path, schema: Optional[FileSchema] = None,
+                          chunk_size: Optional[int] = None) -> bool:
         """Convert a JSON file to Feather format."""
-        return convert_to_feather(filepath, self.output_dir, self.schema_reader, schema)
+        return convert_to_feather(filepath, self.output_dir, self.schema_reader, schema, chunk_size)
     
     def convert_all(self, format_type: str) -> Dict[str, bool]:
         """Convert all JSON files in the data directory to the specified format.
         
+        Uses memory-aware multiprocessing and chunked processing for efficiency.
         Requires a schema report to be generated first using scan-schemas command.
         """
+        from src.converter.memory_manager import (
+            calculate_optimal_workers,
+            calculate_chunk_size,
+            log_memory_stats,
+            MemoryMonitor
+        )
+        
         if not self.data_dir.exists():
             raise FileNotFoundError(f"Data directory not found: {self.data_dir}")
         
@@ -94,6 +107,9 @@ class Converter:
         if not json_files:
             logger.warning(f"No JSON files found in {self.data_dir}")
             return {}
+        
+        # Log initial memory stats
+        log_memory_stats()
         
         # Load schemas - either from schema_reader (if already loaded) or from schema report file
         if self.schema_reader.schemas:
@@ -127,80 +143,103 @@ class Converter:
         use_parallel = not bool(self.schema_reader.schemas)
         
         if use_parallel:
-            # Use ProcessPoolExecutor for parallel processing (when loading from file)
-            max_workers = min(len(json_files), 4)
-            if max_workers < 1: max_workers = 1
+            # Calculate optimal number of workers based on available memory
+            max_workers = calculate_optimal_workers()
+            logger.info(f"Using {max_workers} worker processes for parallel conversion")
             
-            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                future_to_file = {}
+            with MemoryMonitor(f"Parallel conversion of {len(json_files)} files"):
+                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_file = {}
+                    for json_file in json_files:
+                        schema = schemas.get(json_file.name)
+                        if schema is None:
+                            logger.warning(
+                                f"No schema found for {json_file.name} in the schema report. "
+                                "Skipping this file. Please regenerate the schema report."
+                            )
+                            results[json_file.name] = False
+                            continue
+                        
+                        # Calculate optimal chunk size for this file
+                        chunk_size = calculate_chunk_size(json_file)
+                        
+                        # Pass the standalone functions and necessary arguments
+                        # We pass self.output_dir and self.schema_reader explicitly
+                        if format_type.lower() == "parquet":
+                            future = executor.submit(convert_to_parquet, json_file, self.output_dir, 
+                                                    self.schema_reader, schema, chunk_size)
+                        elif format_type.lower() == "csv":
+                            future = executor.submit(convert_to_csv, json_file, self.output_dir, 
+                                                    self.schema_reader, schema, chunk_size)
+                        elif format_type.lower() == "avro":
+                            future = executor.submit(convert_to_avro, json_file, self.output_dir, 
+                                                    self.schema_reader, schema, chunk_size)
+                        elif format_type.lower() == "orc":
+                            future = executor.submit(convert_to_orc, json_file, self.output_dir, 
+                                                    self.schema_reader, schema, chunk_size)
+                        elif format_type.lower() == "feather":
+                            future = executor.submit(convert_to_feather, json_file, self.output_dir, 
+                                                    self.schema_reader, schema, chunk_size)
+                        else:
+                            logger.error(f"Unsupported format: {format_type}")
+                            results[json_file.name] = False
+                            continue
+                        
+                        future_to_file[future] = json_file
+                    
+                    for future in concurrent.futures.as_completed(future_to_file):
+                        json_file = future_to_file[future]
+                        try:
+                            success = future.result()
+                            results[json_file.name] = success
+                        except Exception as e:
+                            logger.error(f"File {json_file.name} generated an exception: {e}")
+                            results[json_file.name] = False
+        else:
+            # Sequential processing (when using pre-loaded schemas to avoid serialization issues)
+            logger.info("Using sequential processing for pre-loaded schemas")
+            
+            with MemoryMonitor(f"Sequential conversion of {len(json_files)} files"):
                 for json_file in json_files:
                     schema = schemas.get(json_file.name)
                     if schema is None:
                         logger.warning(
-                            f"No schema found for {json_file.name} in the schema report. "
-                            "Skipping this file. Please regenerate the schema report."
+                            f"No schema found for {json_file.name}. "
+                            "Skipping this file."
                         )
                         results[json_file.name] = False
                         continue
                     
-                    # Pass the standalone functions and necessary arguments
-                    # We pass self.output_dir and self.schema_reader explicitly
-                    if format_type.lower() == "parquet":
-                        future = executor.submit(convert_to_parquet, json_file, self.output_dir, self.schema_reader, schema)
-                    elif format_type.lower() == "csv":
-                        future = executor.submit(convert_to_csv, json_file, self.output_dir, self.schema_reader, schema)
-                    elif format_type.lower() == "avro":
-                        future = executor.submit(convert_to_avro, json_file, self.output_dir, self.schema_reader, schema)
-                    elif format_type.lower() == "orc":
-                        future = executor.submit(convert_to_orc, json_file, self.output_dir, self.schema_reader, schema)
-                    elif format_type.lower() == "feather":
-                        future = executor.submit(convert_to_feather, json_file, self.output_dir, self.schema_reader, schema)
-                    else:
-                        logger.error(f"Unsupported format: {format_type}")
-                        results[json_file.name] = False
-                        continue
+                    # Calculate optimal chunk size for this file
+                    chunk_size = calculate_chunk_size(json_file)
                     
-                    future_to_file[future] = json_file
-                
-                for future in concurrent.futures.as_completed(future_to_file):
-                    json_file = future_to_file[future]
                     try:
-                        success = future.result()
+                        if format_type.lower() == "parquet":
+                            success = convert_to_parquet(json_file, self.output_dir, 
+                                                        self.schema_reader, schema, chunk_size)
+                        elif format_type.lower() == "csv":
+                            success = convert_to_csv(json_file, self.output_dir, 
+                                                    self.schema_reader, schema, chunk_size)
+                        elif format_type.lower() == "avro":
+                            success = convert_to_avro(json_file, self.output_dir, 
+                                                     self.schema_reader, schema, chunk_size)
+                        elif format_type.lower() == "orc":
+                            success = convert_to_orc(json_file, self.output_dir, 
+                                                    self.schema_reader, schema, chunk_size)
+                        elif format_type.lower() == "feather":
+                            success = convert_to_feather(json_file, self.output_dir, 
+                                                        self.schema_reader, schema, chunk_size)
+                        else:
+                            logger.error(f"Unsupported format: {format_type}")
+                            success = False
+                        
                         results[json_file.name] = success
                     except Exception as e:
                         logger.error(f"File {json_file.name} generated an exception: {e}")
                         results[json_file.name] = False
-        else:
-            # Sequential processing (when using pre-loaded schemas to avoid serialization issues)
-            logger.info("Using sequential processing for pre-loaded schemas")
-            for json_file in json_files:
-                schema = schemas.get(json_file.name)
-                if schema is None:
-                    logger.warning(
-                        f"No schema found for {json_file.name}. "
-                        "Skipping this file."
-                    )
-                    results[json_file.name] = False
-                    continue
-                
-                try:
-                    if format_type.lower() == "parquet":
-                        success = self.convert_to_parquet(json_file, schema)
-                    elif format_type.lower() == "csv":
-                        success = self.convert_to_csv(json_file, schema)
-                    elif format_type.lower() == "avro":
-                        success = self.convert_to_avro(json_file, schema)
-                    elif format_type.lower() == "orc":
-                        success = self.convert_to_orc(json_file, schema)
-                    elif format_type.lower() == "feather":
-                        success = self.convert_to_feather(json_file, schema)
-                    else:
-                        logger.error(f"Unsupported format: {format_type}")
-                        success = False
-                    
-                    results[json_file.name] = success
-                except Exception as e:
-                    logger.error(f"File {json_file.name} generated an exception: {e}")
-                    results[json_file.name] = False
+        
+        # Log final memory stats
+        log_memory_stats()
         
         return results
+
