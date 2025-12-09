@@ -194,3 +194,55 @@ def prepare_dataframe(records: List[Dict[str, Any]], schema: FileSchema) -> pd.D
             )
     
     return df
+
+def prepare_dataframe_chunk(records: List[Dict[str, Any]], schema: FileSchema, 
+                           column_order: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Prepare a pandas DataFrame chunk from records using the schema.
+    
+    This is optimized for chunked processing where we may need consistent
+    column ordering across multiple chunks.
+    
+    Args:
+        records: List of record dictionaries
+        schema: FileSchema object with field definitions
+        column_order: Optional list of column names for consistent ordering
+    
+    Returns:
+        DataFrame with records prepared according to schema
+    """
+    if not records:
+        return pd.DataFrame()
+    
+    # Flatten all records
+    flattened_records = []
+    for record in records:
+        flattened = flatten_dict(record)
+        flattened_records.append(flattened)
+    
+    # Create DataFrame
+    df = pd.DataFrame(flattened_records)
+    
+    # Determine column order (use provided or derive from schema)
+    if column_order is None:
+        schema_fields = sorted(schema.fields.keys())
+        column_order = [f for f in schema_fields if f in df.columns]
+    
+    # Ensure all required columns are present (fill missing with None)
+    for field_name in column_order:
+        if field_name not in df.columns:
+            df[field_name] = None
+    
+    # Select and reorder columns
+    existing_cols = [col for col in column_order if col in df.columns]
+    df = df[existing_cols]
+    
+    # Apply type coercion based on schema
+    for field_name, field in schema.fields.items():
+        if field_name in df.columns:
+            df[field_name] = df[field_name].apply(
+                lambda x: coerce_type(x, field.field_type)
+            )
+    
+    return df
+
